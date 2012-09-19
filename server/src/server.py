@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# -*- Mode: Python; tab-width: 4; indent-tabs-mode: nil; -*- 
+# -*- Mode: Python; tab-width: 4; indent-tabs-mode: nil; -*-
 # vim:set ft=python ts=4 sw=4 sts=4 autoindent:
 
 '''
@@ -23,6 +23,10 @@ from os.path import join as path_join
 from sys import version_info, stderr
 from time import time
 from thread import allocate_lock
+# TODO this might cause problems
+# (see "necessary imports after enabling the logging, order critical" below)
+from jsonwrap import dumps
+from cgi import FieldStorage
 
 ### Constants
 # This handling of version_info is strictly for backwards compability
@@ -30,10 +34,23 @@ PY_VER_STR = '%d.%d.%d-%s-%d' % tuple(version_info)
 REQUIRED_PY_VERSION = (2, 5, 0, 'alpha', 1)
 REQUIRED_PY_VERSION_STR = '%d.%d.%d-%s-%d' % tuple(REQUIRED_PY_VERSION)
 JSON_HDR = ('Content-Type', 'application/json')
+JSONP_HDR = ('Content-Type', 'application/javascript')
 CONF_FNAME = 'config.py'
 CONF_TEMPLATE_FNAME = 'config_template.py'
 CONFIG_CHECK_LOCK = allocate_lock()
 ###
+
+
+def make_json_response(json_dic, http_args):
+    json_str = dumps(json_dic)
+
+    if 'callback' in http_args:
+        callback = http_args['callback']
+        if isinstance(http_args, FieldStorage):
+            callback = callback.value
+        return ((JSONP_HDR, ), '%s(%s);' % (callback, json_str))
+    else:
+        return ((JSON_HDR, ), json_str)
 
 
 class PermissionError(Exception):
@@ -50,14 +67,13 @@ class ConfigurationError(Exception):
 def _permission_check():
     from os import access, R_OK, W_OK
     from config import DATA_DIR, WORK_DIR
-    from jsonwrap import dumps
     from message import Messager
 
     if not access(WORK_DIR, R_OK | W_OK):
         Messager.error((('Work dir: "%s" is not read-able and ' % WORK_DIR) +
                 'write-able by the server'), duration=-1)
         raise PermissionError
-    
+
     if not access(DATA_DIR, R_OK):
         Messager.error((('Data dir: "%s" is not read-able ' % DATA_DIR) +
                 'by the server'), duration=-1)
@@ -77,13 +93,12 @@ def _miss_config_msg():
             'installation, copy the template file %s to %s in '
             'your installation directory ("cp %s %s") and edit '
             'it to suit your environment.'
-            ) % (CONF_FNAME, CONF_TEMPLATE_FNAME, CONF_FNAME, 
+            ) % (CONF_FNAME, CONF_TEMPLATE_FNAME, CONF_FNAME,
                 CONF_TEMPLATE_FNAME, CONF_FNAME)
 
 # Check for existance and sanity of the configuration
 def _config_check():
     from message import Messager
-    
     from sys import path
     from copy import deepcopy
     from os.path import dirname
@@ -170,7 +185,6 @@ def _safe_serve(params, client_ip, client_hostname, cookie_data):
     try:
         from common import ProtocolError, ProtocolArgumentError, NoPrintJSONError
         from dispatch import dispatch
-        from jsonwrap import dumps
         from message import Messager
         from session import get_session, init_session, close_session, NoSessionError
     except ImportError:
@@ -197,7 +211,7 @@ def _safe_serve(params, client_ip, client_hostname, cookie_data):
 
         # Dispatch the request
         json_dic = dispatch(http_args, client_ip, client_hostname)
-        response_data = ((JSON_HDR, ), dumps(Messager.output_json(json_dic)))
+        response_data = make_json_response(Messager.output_json(json_dic), http_args)
     except ProtocolError, e:
         # Internal error, only reported to client not to log
         json_dic = {}
@@ -208,7 +222,7 @@ def _safe_serve(params, client_ip, client_hostname, cookie_data):
         if err_str != '':
             Messager.error(err_str)
 
-        response_data = ((JSON_HDR, ), dumps(Messager.output_json(json_dic)))
+        response_data = make_json_response(Messager.output_json(json_dic), params)
     except NoPrintJSONError, e:
         # Terrible hack to serve other things than JSON
         response_data = (e.hdrs, e.data)
@@ -222,10 +236,11 @@ def _safe_serve(params, client_ip, client_hostname, cookie_data):
 
     return (cookie_hdrs, response_data)
 
+
 # Programmatically access the stack-trace
 def _get_stack_trace():
     from traceback import print_exc
-    
+
     try:
         from cStringIO import StringIO
     except ImportError:
@@ -237,10 +252,10 @@ def _get_stack_trace():
     buf.seek(0)
     return buf.read()
 
+
 # Encapsulate an interpreter crash
-def _server_crash(cookie_hdrs, e):
+def _server_crash(params, cookie_hdrs, e):
     from config import ADMIN_CONTACT_EMAIL, DEBUG
-    from jsonwrap import dumps
     from message import Messager
 
     stack_trace = _get_stack_trace()
@@ -265,17 +280,20 @@ def _server_crash(cookie_hdrs, e):
     json_dic = {
             'exception': 'serverCrash',
             }
-    return (cookie_hdrs, ((JSON_HDR, ), dumps(Messager.output_json(json_dic))))
+    return (cookie_hdrs,
+            make_json_response(Messager.output_json(json_dic), params))
 
 # Serve the client request
 def serve(params, client_ip, client_hostname, cookie_data):
     # The session relies on the config, wait-for-it
     cookie_hdrs = None
 
-    # Do we have a Python version compatibly with our libs?
+    # Do we have a Python version compatible with our libs?
     if (version_info[0] != REQUIRED_PY_VERSION[0] or
             version_info < REQUIRED_PY_VERSION):
         # Bail with hand-writen JSON, this is very fragile to protocol changes
+        # TODO: wrap this with make_json_response, but we can't rely on dumps()
+        # being here at this point
         return cookie_hdrs, ((JSON_HDR, ),
                 ('''
 {
@@ -290,9 +308,8 @@ def serve(params, client_ip, client_hostname, cookie_data):
                 ''' % (PY_VER_STR, REQUIRED_PY_VERSION_STR)).strip())
 
     # We can now safely use json and Messager
-    from jsonwrap import dumps
     from message import Messager
-    
+
     try:
         # We need to lock here since flup uses threads for each request and
         # can thus manipulate each other's global variables
@@ -301,7 +318,8 @@ def serve(params, client_ip, client_hostname, cookie_data):
     except ConfigurationError, e:
         json_dic = {}
         e.json(json_dic)
-        return cookie_hdrs, ((JSON_HDR, ), dumps(Messager.output_json(json_dic)))
+        return (cookie_hdrs,
+                make_json_response(Messager.output_json(json_dic), params))
     # We can now safely read the config
     from config import DEBUG
 
@@ -310,11 +328,14 @@ def serve(params, client_ip, client_hostname, cookie_data):
     except PermissionError, e:
         json_dic = {}
         e.json(json_dic)
-        return cookie_hdrs, ((JSON_HDR, ), dumps(Messager.output_json(json_dic)))
+
+        return (cookie_hdrs,
+                make_json_response(Messager.output_json(json_dic), params))
 
     try:
         # Safe region, can throw any exception, has verified installation
         return _safe_serve(params, client_ip, client_hostname, cookie_data)
     except BaseException, e:
         # Handle the server crash
-        return _server_crash(cookie_hdrs, e)
+        return _server_crash(params, cookie_hdrs, e)
+
